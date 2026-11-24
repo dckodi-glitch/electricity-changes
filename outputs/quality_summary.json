@@ -19,5 +19,10 @@
   "active_power_missing_marker": "?",
   "active_power_unit": "kW, minute-average",
   "energy_unit": "kWh",
-  "method": "Sum valid Global_active_power values in kW and divide by 60."
+  "method": "Sum valid Global_active_power values in kW and divide by 60.",
+  "hourly_group_count": 24,
+  "complete_hour_groups": 24,
+  "incomplete_hour_groups": 0,
+  "hourly_coverage_rule": "A clock-hour group is complete when at least 90% of all expected minute slots in that source clock hour have valid active-power readings. Expected slots span the inclusive first-to-last timestamp period, including timestamp gaps; incomplete group means are omitted.",
+  "hourly_time_convention": "Group by the timezone-naive source timestamp clock hour; no timezone or daylight-saving adjustment is inferred."
 }

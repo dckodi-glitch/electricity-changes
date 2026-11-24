@@ -14,7 +14,7 @@ import subprocess
 import sys
 import zipfile
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
@@ -42,11 +42,20 @@ TIME_PATTERN = re.compile(r"\d{2}:\d{2}:\d{2}\Z")
 
 
 @dataclass
+class Hourly:
+    observed_minutes: int = 0
+    valid_power_minutes: int = 0
+    missing_power_minutes: int = 0
+    active_power_sum_kw: Decimal = Decimal("0")
+
+
+@dataclass
 class Daily:
     observed_minutes: int = 0
     valid_power_minutes: int = 0
     missing_power_minutes: int = 0
     active_power_sum_kw: Decimal = Decimal("0")
+    hourly: dict[int, Hourly] = field(default_factory=dict)
 
 
 def validate_member_name(name: str) -> None:
@@ -117,6 +126,19 @@ def expected_minutes_for_date(day: date, first: datetime, last: datetime) -> int
     day_end = day_start + timedelta(days=1) - MINUTE
     interval_start = max(first, day_start)
     interval_end = min(last, day_end)
+    if interval_end < interval_start:
+        return 0
+    return int((interval_end - interval_start) / MINUTE) + 1
+
+
+def expected_minutes_for_hour(
+    day: date, hour: int, first: datetime, last: datetime
+) -> int:
+    """Count expected minute slots in a clock hour, clipped to observed bounds."""
+    hour_start = datetime.combine(day, time(hour=hour))
+    hour_end = hour_start + timedelta(hours=1) - MINUTE
+    interval_start = max(first, hour_start)
+    interval_end = min(last, hour_end)
     if interval_end < interval_start:
         return 0
     return int((interval_end - interval_start) / MINUTE) + 1
@@ -195,14 +217,19 @@ def read_daily(zip_path: Path) -> tuple[dict[date, Daily], dict[str, object]]:
                 power = parse_power(row[2], line_number)
                 day = timestamp.date()
                 record = daily[day]
+                hour_record = record.hourly.setdefault(timestamp.hour, Hourly())
                 record.observed_minutes += 1
+                hour_record.observed_minutes += 1
                 row_count += 1
                 if power is None:
                     record.missing_power_minutes += 1
+                    hour_record.missing_power_minutes += 1
                     missing_power += 1
                 else:
                     record.valid_power_minutes += 1
                     record.active_power_sum_kw += power
+                    hour_record.valid_power_minutes += 1
+                    hour_record.active_power_sum_kw += power
                 first = timestamp if first is None else first
                 last = timestamp
                 prior = timestamp
@@ -271,6 +298,72 @@ def write_daily_csv(
             writer.writerow(row.values())
             rows.append(row)
             day += timedelta(days=1)
+    return rows
+
+
+def write_hourly_csv(
+    path: Path, daily: dict[date, Daily], first: datetime, last: datetime
+) -> list[dict[str, object]]:
+    """Write all 24 clock-hour aggregates; means require at least 90% coverage."""
+    grouped = {hour: Hourly() for hour in range(24)}
+    expected = {hour: 0 for hour in range(24)}
+    day = first.date()
+    while day <= last.date():
+        for hour in range(24):
+            expected[hour] += expected_minutes_for_hour(day, hour, first, last)
+            source = daily.get(day, Daily()).hourly.get(hour, Hourly())
+            target = grouped[hour]
+            target.observed_minutes += source.observed_minutes
+            target.valid_power_minutes += source.valid_power_minutes
+            target.missing_power_minutes += source.missing_power_minutes
+            target.active_power_sum_kw += source.active_power_sum_kw
+        day += timedelta(days=1)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    with path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(
+            (
+                "hour_of_day",
+                "mean_active_power_kw",
+                "expected_minutes",
+                "observed_minutes",
+                "valid_power_minutes",
+                "missing_power_minutes",
+                "valid_coverage_pct",
+                "minimum_valid_minutes",
+                "complete_hour",
+            )
+        )
+        for hour in range(24):
+            record = grouped[hour]
+            expected_count = expected[hour]
+            minimum_valid = (expected_count * 9 + 9) // 10
+            complete = expected_count > 0 and record.valid_power_minutes >= minimum_valid
+            coverage = (
+                100 * record.valid_power_minutes / expected_count
+                if expected_count
+                else 0
+            )
+            mean_power = (
+                f"{record.active_power_sum_kw / record.valid_power_minutes:.6f}"
+                if complete
+                else ""
+            )
+            row = {
+                "hour_of_day": f"{hour:02d}:00",
+                "mean_active_power_kw": mean_power,
+                "expected_minutes": expected_count,
+                "observed_minutes": record.observed_minutes,
+                "valid_power_minutes": record.valid_power_minutes,
+                "missing_power_minutes": record.missing_power_minutes,
+                "valid_coverage_pct": f"{coverage:.3f}",
+                "minimum_valid_minutes": minimum_valid,
+                "complete_hour": "true" if complete else "false",
+            }
+            writer.writerow(row.values())
+            rows.append(row)
     return rows
 
 
@@ -364,6 +457,97 @@ def write_svg(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("\n".join(elements) + "\n", encoding="utf-8")
 
 
+def write_hourly_svg(path: Path, rows: list[dict[str, object]]) -> None:
+    width, height = 1200, 520
+    left, right, top, bottom = 82, 28, 68, 96
+    plot_width, plot_height = width - left - right, height - top - bottom
+    values = [
+        float(row["mean_active_power_kw"])
+        for row in rows
+        if row["complete_hour"] == "true"
+    ]
+    maximum = max(values, default=1.0)
+    y_max = max(1.0, math.ceil(maximum / 0.5) * 0.5)
+    bar_width = plot_width / len(rows) * 0.62
+
+    def y_at(value: float) -> float:
+        return top + plot_height * (1 - value / y_max)
+
+    elements = [
+        '<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" '
+        f'viewBox="0 0 {width} {height}">',
+        "<title id=\"title\">Average active power by hour of day</title>",
+        (
+            '<desc id="desc">Mean of valid minute-average active-power readings in '
+            'kilowatts, grouped by the source clock hour across the full observation '
+            'period. An hour is included only when at least 90 percent of its expected '
+            'minute slots have valid readings. Timestamps are timezone-naive.</desc>'
+        ),
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="82" y="30" font-family="sans-serif" font-size="21" font-weight="700">'
+        "Average active power by hour of day</text>",
+    ]
+    for tick in range(5):
+        value = y_max * tick / 4
+        y = y_at(value)
+        elements.extend(
+            [
+                f'<line x1="{left}" y1="{y:.2f}" x2="{width-right}" y2="{y:.2f}" '
+                'stroke="#e5e7eb"/>',
+                f'<text x="{left-12}" y="{y+4:.2f}" text-anchor="end" '
+                f'font-family="sans-serif" font-size="12" fill="#374151">{value:.1f}</text>',
+            ]
+        )
+    for index, row in enumerate(rows):
+        center = left + plot_width * (index + 0.5) / len(rows)
+        complete = row["complete_hour"] == "true"
+        coverage = str(row["valid_coverage_pct"])
+        valid = str(row["valid_power_minutes"])
+        expected = str(row["expected_minutes"])
+        color = "#1769aa" if complete else "#c76b00"
+        if complete:
+            mean = float(str(row["mean_active_power_kw"]))
+            y = y_at(mean)
+            elements.append(
+                f'<rect x="{center-bar_width/2:.2f}" y="{y:.2f}" '
+                f'width="{bar_width:.2f}" height="{top+plot_height-y:.2f}" '
+                f'fill="{color}"><title>{row["hour_of_day"]}, mean {mean:.6f} kW; '
+                f'{valid} valid of {expected} expected minutes; coverage {coverage}%'
+                "</title></rect>"
+            )
+        else:
+            elements.append(
+                f'<rect x="{center-bar_width/2:.2f}" y="{top+plot_height-4:.2f}" '
+                f'width="{bar_width:.2f}" height="4" fill="{color}">'
+                f'<title>{row["hour_of_day"]}: incomplete; {valid} valid of '
+                f'{expected} expected minutes; coverage {coverage}%</title></rect>'
+            )
+        elements.append(
+            f'<text x="{center:.2f}" y="{top+plot_height+20}" text-anchor="middle" '
+            f'font-family="sans-serif" font-size="11">{row["hour_of_day"][:2]}</text>'
+        )
+    elements.extend(
+        [
+            f'<line x1="{left}" y1="{top+plot_height}" x2="{width-right}" '
+            f'y2="{top+plot_height}" stroke="#111827"/>',
+            f'<text x="22" y="{top+plot_height/2}" transform="rotate(-90 22 '
+            f'{top+plot_height/2})" text-anchor="middle" font-family="sans-serif" '
+            'font-size="13">Mean active power (kW)</text>',
+            f'<text x="{width/2}" y="{height-18}" text-anchor="middle" '
+            'font-family="sans-serif" font-size="13">Hour of day (source clock; timezone unspecified)</text>',
+            '<rect x="920" y="20" width="12" height="12" fill="#1769aa"/>',
+            '<text x="938" y="31" font-family="sans-serif" font-size="12">'
+            "Meets 90% valid-coverage rule</text>",
+            '<rect x="920" y="39" width="12" height="12" fill="#c76b00"/>',
+            '<text x="938" y="50" font-family="sans-serif" font-size="12">'
+            "Incomplete (mean omitted)</text>",
+            "</svg>",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+
+
 def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
     daily, quality = read_daily(zip_path)
     first = datetime.fromisoformat(str(quality["first_timestamp"]))
@@ -371,11 +555,15 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "daily_consumption.csv"
     svg_path = output_dir / "daily_consumption.svg"
+    hourly_csv_path = output_dir / "hourly_active_power.csv"
+    hourly_svg_path = output_dir / "hourly_active_power.svg"
     quality_path = output_dir / "quality_summary.json"
     metadata_path = output_dir / "export_metadata.json"
 
     rows = write_daily_csv(csv_path, daily, first, last)
     write_svg(svg_path, rows)
+    hourly_rows = write_hourly_csv(hourly_csv_path, daily, first, last)
+    write_hourly_svg(hourly_svg_path, hourly_rows)
 
     valid_minutes = sum(item.valid_power_minutes for item in daily.values())
     complete_days = sum(row["complete_day"] == "true" for row in rows)
@@ -393,6 +581,23 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
             "active_power_unit": "kW, minute-average",
             "energy_unit": "kWh",
             "method": "Sum valid Global_active_power values in kW and divide by 60.",
+            "hourly_group_count": 24,
+            "complete_hour_groups": sum(
+                row["complete_hour"] == "true" for row in hourly_rows
+            ),
+            "incomplete_hour_groups": sum(
+                row["complete_hour"] != "true" for row in hourly_rows
+            ),
+            "hourly_coverage_rule": (
+                "A clock-hour group is complete when at least 90% of all expected "
+                "minute slots in that source clock hour have valid active-power "
+                "readings. Expected slots span the inclusive first-to-last timestamp "
+                "period, including timestamp gaps; incomplete group means are omitted."
+            ),
+            "hourly_time_convention": (
+                "Group by the timezone-naive source timestamp clock hour; no timezone "
+                "or daylight-saving adjustment is inferred."
+            ),
         }
     )
     quality_path.write_text(
@@ -411,10 +616,15 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
         dirty = None
     metadata = {
         "project": "Historical household electricity case study",
+        "milestone_label": {
+            "id": "e03",
+            "coverage_date": "2024-08-07",
+            "coverage_date_is_execution_date": False,
+        },
         "question": (
             "What daily active electricity energy is present in the recorded "
-            "minute-average power for one French household, and how complete are "
-            "the daily observations?"
+            "minute-average power for one French household, how complete are the "
+            "daily observations, and how does mean active power vary by source clock hour?"
         ),
         "observation_period": {
             "first_timestamp": quality["first_timestamp"],
@@ -455,6 +665,12 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
                 "Global_active_power is a minute-average in kW. Daily kWh is the sum of "
                 "valid minute values divided by 60."
             ),
+            "hourly_summary": (
+                "For each timezone-naive source clock hour, mean active power is the "
+                "arithmetic mean of valid minute-average kW readings across the "
+                "observation period. The group is marked complete only at >=90% valid "
+                "coverage against expected minute slots; otherwise its mean is omitted."
+            ),
             "missing_data": (
                 "'?' is counted as missing; missing power is not imputed. Coverage "
                 "denominators account for partial first/last calendar days."
@@ -466,7 +682,7 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
         },
         "limitations": [
             "One historical French household; results do not represent the user's home or households generally.",
-            "Daily aggregate active energy cannot identify appliance-level use or savings.",
+            "Daily and hour-of-day aggregate active power cannot identify appliance use, household behavior, or savings.",
             "Missing active-power minutes are excluded from energy sums and reduce valid coverage.",
             "No forecasting, causal inference, or tariff estimate is included.",
         ],
@@ -474,8 +690,10 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
             name: path.relative_to(repo_root).as_posix()
             for name, path in (
                 ("daily_csv", csv_path.resolve()),
+                ("hourly_csv", hourly_csv_path.resolve()),
                 ("quality_summary", quality_path.resolve()),
                 ("visualization_svg", svg_path.resolve()),
+                ("hourly_visualization_svg", hourly_svg_path.resolve()),
                 ("metadata", metadata_path.resolve()),
             )
         },
@@ -483,7 +701,12 @@ def run_analysis(zip_path: Path, output_dir: Path) -> dict[str, object]:
     metadata_path.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    return {"rows": rows, "quality": quality, "metadata": metadata}
+    return {
+        "rows": rows,
+        "hourly_rows": hourly_rows,
+        "quality": quality,
+        "metadata": metadata,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -508,8 +731,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"analysis failed: {exc}", file=sys.stderr)
         return 2
     print(
-        f"Wrote {len(result['rows'])} daily rows; "
-        f"{result['quality']['complete_days']} complete days."
+        f"Wrote {len(result['rows'])} daily rows and "
+        f"{len(result['hourly_rows'])} hourly groups; "
+        f"{result['quality']['complete_days']} complete days and "
+        f"{result['quality']['complete_hour_groups']} complete hour groups."
     )
     return 0
 
