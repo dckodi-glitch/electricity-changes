@@ -17,6 +17,7 @@ from analysis.household_power import (
     read_daily,
     run_analysis,
     write_daily_csv,
+    write_hourly_csv,
 )
 
 
@@ -77,6 +78,37 @@ class HouseholdPowerTests(unittest.TestCase):
             self.assertEqual(quality["missing_active_power_minutes"], 1)
             self.assertEqual(daily[date(2020, 1, 1)].missing_power_minutes, 1)
             self.assertEqual(daily[date(2020, 1, 1)].valid_power_minutes, 1)
+
+    def test_hourly_summary_applies_ninety_percent_valid_coverage_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, powers, expected_complete, expected_mean in (
+                ("complete.zip", ["1,000"] * 9 + ["?"], "true", "1.000000"),
+                ("incomplete.zip", ["1,000"] * 8 + ["?", "?"], "false", ""),
+            ):
+                archive = root / name
+                create_archive(
+                    archive,
+                    [
+                        observation("01/01/2020", f"00:{minute:02d}:00", power)
+                        for minute, power in enumerate(powers)
+                    ],
+                )
+                daily, quality = read_daily(archive)
+                rows = write_hourly_csv(
+                    root / f"{name}.csv",
+                    daily,
+                    datetime.fromisoformat(str(quality["first_timestamp"])),
+                    datetime.fromisoformat(str(quality["last_timestamp"])),
+                )
+                hour_zero = rows[0]
+                self.assertEqual(hour_zero["expected_minutes"], 10)
+                self.assertEqual(hour_zero["valid_power_minutes"], 9 if expected_complete == "true" else 8)
+                self.assertEqual(hour_zero["valid_coverage_pct"], "90.000" if expected_complete == "true" else "80.000")
+                self.assertEqual(hour_zero["complete_hour"], expected_complete)
+                self.assertEqual(hour_zero["mean_active_power_kw"], expected_mean)
+                self.assertEqual(rows[1]["expected_minutes"], 0)
+                self.assertEqual(rows[1]["complete_hour"], "false")
 
     def test_calendar_day_without_rows_is_exported_with_zero_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -179,6 +211,17 @@ class HouseholdPowerTests(unittest.TestCase):
                 'data-date="2020-01-01" data-daily-energy-kwh="0.033333"',
                 svg,
             )
+            hourly_csv = root / "outputs" / "hourly_active_power.csv"
+            with hourly_csv.open(encoding="utf-8", newline="") as source:
+                hourly_rows = list(csv.DictReader(source))
+            self.assertEqual(len(hourly_rows), 24)
+            self.assertEqual(hourly_rows[0]["mean_active_power_kw"], "1.000000")
+            self.assertEqual(hourly_rows[0]["valid_power_minutes"], "2")
+            hourly_svg = (root / "outputs" / "hourly_active_power.svg").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('role="img" aria-labelledby="title desc"', hourly_svg)
+            self.assertIn("timezone-naive", hourly_svg)
             metadata = json.loads(
                 (root / "outputs" / "export_metadata.json").read_text(
                     encoding="utf-8"
@@ -187,6 +230,10 @@ class HouseholdPowerTests(unittest.TestCase):
             self.assertIsNone(metadata["publication_date"])
             self.assertEqual(result["rows"][0]["daily_energy_kwh"], rows[0]["daily_energy_kwh"])
             self.assertEqual(metadata["outputs"]["daily_csv"], "outputs/daily_consumption.csv")
+            self.assertEqual(
+                metadata["outputs"]["hourly_csv"], "outputs/hourly_active_power.csv"
+            )
+            self.assertEqual(metadata["method"]["hourly_summary"].count("90%"), 1)
         self.assertEqual(parse_power("4.216", 2), Decimal("4.216"))
 
 
